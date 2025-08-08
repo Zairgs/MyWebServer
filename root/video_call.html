@@ -1,0 +1,245 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>局域网视频通话（仅视频）</title>
+<style>
+  body{margin:0;background:#0f172a;color:#e2e8f0;font-family:system-ui,-apple-system,Segoe UI,Roboto}
+  .wrap{max-width:1100px;margin:24px auto;padding:0 16px;display:grid;grid-template-columns:1.1fr .9fr;gap:16px}
+  .card{background:#0b1220;border:1px solid #1f2937;border-radius:12px;padding:12px}
+  h3{margin:0 0 10px;font-weight:600}
+  video{width:100%;height:360px;background:#000;border-radius:8px}
+  .row{display:flex;gap:8px;flex-wrap:wrap;margin-top:8px}
+  input,button{height:36px;border-radius:8px;border:1px solid #334155;background:#0b1220;color:#e2e8f0;padding:0 10px}
+  input{min-width:280px;flex:1}
+  button{cursor:pointer}
+  button.primary{background:#2563eb;border-color:#1d4ed8}
+  .status{height:240px;overflow:auto;font-family:ui-monospace,Consolas,monospace;background:#0a0f1c;border-radius:8px;padding:8px;border:1px solid #1f2937}
+  .dot{display:inline-block;width:10px;height:10px;border-radius:50%}
+  .ok{background:#22c55e}.bad{background:#ef4444}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="card">
+    <h3>本地视频</h3>
+    <video id="localVideo" autoplay playsinline muted></video>
+    <div class="row">
+      <label>房间号：</label><input id="room" placeholder="room123" />
+    </div>
+    <div class="row">
+      <label>信令服务器：</label>
+      <input id="server" placeholder="ws(s)://IP:PORT/webrtc" />
+    </div>
+    <div class="row">
+      <button id="joinBtn" class="primary">加入房间</button>
+      <button id="leaveBtn">离开房间</button>
+      <span>连接：<span id="connDot" class="dot bad"></span></span>
+    </div>
+  </div>
+
+  <div class="card">
+    <h3>远程视频</h3>
+    <video id="remoteVideo" autoplay playsinline></video>
+    <h3 style="margin-top:10px">连接状态</h3>
+    <div id="status" class="status"></div>
+  </div>
+</div>
+
+<script>
+let ws=null, pc=null, localStream=null, room="";
+let remoteDescSet=false, pendingOffer=null, pendingCandidates=[];
+let makingOffer=false;
+
+function ts(){ const d=new Date(); return d.toTimeString().slice(0,8); }
+function log(msg,isErr=false){ const box=document.getElementById('status'); const ln=document.createElement('div'); ln.textContent=`[${ts()}] ${isErr?'错误: ':''}${msg}`; ln.style.color=isErr?'#f87171':'#e2e8f0'; box.appendChild(ln); box.scrollTop=box.scrollHeight; }
+function setConn(ok){ document.getElementById('connDot').className='dot '+(ok?'ok':'bad'); }
+
+function normalizeSdp(raw,defType){
+  try{
+    if(!raw) return null;
+    if(typeof raw==='object'&&raw.sdp){ const t=(raw.type||defType||'').toString().toLowerCase(); return {type:t||defType,sdp:String(raw.sdp)};}
+    if(typeof raw==='string'){ const txt=raw.trim(); if(txt.startsWith('{')){ try{ const o=JSON.parse(txt); if(o&&o.sdp){ const t=(o.type||defType||'').toString().toLowerCase(); return {type:t||defType,sdp:String(o.sdp)}; } }catch{} } return {type:defType,sdp:txt}; }
+  }catch(e){ log('SDP标准化失败: '+e.message,true); }
+  return null;
+}
+
+async function processPending(){
+  try{
+    if(pendingOffer&&pc){
+      log('检测到缓存的OFFER，开始处理');
+      const norm=normalizeSdp(pendingOffer,'offer'); if(!norm){ log('收到的OFFER格式不正确',true); return; }
+      if(pc.signalingState==='have-local-offer'){ try{ await pc.setLocalDescription({type:'rollback'}); log('检测到glare，已回滚本地offer'); }catch(e){ log('回滚失败: '+e.message,true); } }
+      await pc.setRemoteDescription(norm); remoteDescSet=true;
+      const ans=await pc.createAnswer(); await pc.setLocalDescription(ans);
+      if(ws&&ws.readyState===WebSocket.OPEN){ ws.send(JSON.stringify({type:'answer',room,sdp:pc.localDescription})); log('已回复ANSWER（处理缓存OFFER）'); } else { log('WS未就绪，无法发送ANSWER',true); }
+      for(const c of pendingCandidates){ try{ await pc.addIceCandidate({candidate:c.candidate,sdpMid:c.sdpMid,sdpMLineIndex:c.sdpMLineIndex}); }catch(e){ log('缓存ICE添加失败: '+e.message,true); } }
+      pendingCandidates=[]; pendingOffer=null;
+    }
+  }catch(e){ log('处理缓存消息失败: '+e.message,true); }
+}
+
+function maybeCreateOffer(){
+  if(!pc){ log('跳过创建OFFER：pc未初始化'); return; }
+  if(pendingOffer){ log('跳过创建OFFER：已收到对端OFFER'); return; }
+  if(!ws||ws.readyState!==WebSocket.OPEN){ log('跳过创建OFFER：WS未就绪'); return; }
+  const hasLocal = pc.getSenders&&pc.getSenders().some(s=>s.track);
+  const hasTr = pc.getTransceivers&&pc.getTransceivers().length>0;
+  if(!hasLocal&&!hasTr){ log('延迟创建OFFER：等待本地视频或对端OFFER'); return; }
+  pc.createOffer().then(o=>pc.setLocalDescription(o)).then(()=>{ ws.send(JSON.stringify({type:'offer',room,sdp:pc.localDescription})); log('已发送OFFER'); }).catch(e=>log('创建OFFER失败: '+e.message,true));
+}
+
+function startWebRTC(stream){
+  const config={
+    iceServers:[
+      {urls:'stun:stun.l.google.com:19302'},
+      // 若无外网，在 192.168.39.69 部署 coturn 后，去掉下一行注释：
+      // {urls:'turn:192.168.39.69:3478?transport=udp', username:'demo', credential:'demo'}
+    ],
+    // bundlePolicy:'max-bundle',
+  };
+  pc=new RTCPeerConnection(config);
+  log('PeerConnection已创建');
+
+  // 仅视频：预置 video 收发意图
+  try{ pc.addTransceiver('video',{direction:'sendrecv'});}catch{}
+
+  // 二次协商：动态加轨道或方向变化时触发
+  pc.onnegotiationneeded=async()=>{
+    try{
+      if(makingOffer) return;
+      if(pendingOffer){ log('跳过本地协商：对端OFFER待处理'); return; }
+      if(!ws||ws.readyState!==WebSocket.OPEN){ log('跳过本地协商：WS未就绪'); return; }
+      makingOffer=true;
+      const offer=await pc.createOffer(); await pc.setLocalDescription(offer);
+      ws.send(JSON.stringify({type:'offer',room,sdp:pc.localDescription}));
+      log('因 negotiationneeded 已重新发送OFFER');
+    }catch(e){ log('negotiationneeded失败: '+e.message,true); }
+    finally{ makingOffer=false; }
+  };
+
+  // 本地轨道（只有视频）
+  if(stream&&stream.getVideoTracks){ stream.getVideoTracks().forEach(t=>pc.addTrack(t,stream)); }
+
+  // 远端轨道 + 自动播放兜底
+  pc.ontrack=(ev)=>{
+    const rv=document.getElementById('remoteVideo');
+    const s=(ev.streams&&ev.streams[0])?ev.streams[0]:(()=>{const ms=new MediaStream(); ms.addTrack(ev.track); return ms;})();
+    if(rv.srcObject!==s) rv.srcObject=s;
+    rv.muted=true; rv.autoplay=true; rv.playsInline=true;
+    rv.play().then(()=>log('远端视频播放中')).catch(err=>{
+      log('自动播放被阻止，轻点远端视频以开始播放',true);
+      const h=()=>{ rv.play().catch(e=>log('播放失败: '+e.message,true)); rv.removeEventListener('click',h); };
+      rv.addEventListener('click',h,{once:true});
+    });
+    log('已接收远端轨道');
+  };
+
+  pc.onicecandidate=(ev)=>{
+    if(ev.candidate&&ws&&ws.readyState===WebSocket.OPEN){
+      ws.send(JSON.stringify({type:'candidate',room,candidate:{
+        candidate:ev.candidate.candidate,sdpMid:ev.candidate.sdpMid,sdpMLineIndex:ev.candidate.sdpMLineIndex
+      }}));
+      log('发现ICE候选');
+    }
+  };
+  pc.oniceconnectionstatechange=()=>log('ICE状态: '+pc.iceConnectionState);
+
+  setTimeout(processPending,0);
+}
+
+async function joinRoom(){
+  room=(document.getElementById('room').value||'').trim();
+  const serverUrl=(document.getElementById('server').value||'').trim();
+  if(!room){ log('请填写房间号',true); return; }
+  if(!serverUrl){ log('请填写信令服务器地址',true); return; }
+
+  log(`正在加入房间: ${room}...`);
+  log(`正在连接信令服务器: ${serverUrl}`);
+  setConn(false);
+
+  try{ if(!pc){ startWebRTC(new MediaStream()); log('已创建空的PeerConnection，等待媒体权限'); } }catch(e){ log('创建空PeerConnection失败: '+e.message,true); }
+
+  // 仅视频采集
+  try{
+    const gum=(navigator.mediaDevices&&navigator.mediaDevices.getUserMedia)?navigator.mediaDevices.getUserMedia.bind(navigator.mediaDevices)
+      :(navigator.webkitGetUserMedia&&((c)=>new Promise((res,rej)=>navigator.webkitGetUserMedia(c,res,rej))));
+    if(gum){
+      gum({video:true,audio:false}).then(stream=>{
+        localStream=stream; document.getElementById('localVideo').srcObject=stream;
+        log('已获取本地媒体流');
+        if(pc){ stream.getVideoTracks().forEach(t=>pc.addTrack(t,stream)); log('已将本地轨道添加到已存在的PeerConnection'); }
+      }).catch(e=>log('无法访问摄像头: '+e.message,true));
+    }else{ log('当前浏览器不支持 getUserMedia',true); }
+  }catch(e){ log('获取媒体流异常: '+e.message,true); }
+
+  try{ ws=new WebSocket(serverUrl); }catch(e){ log('创建WebSocket失败: '+e.message,true); return; }
+
+  ws.onopen=()=>{
+    log('已连接到信令服务器'); setConn(true);
+    ws.send(JSON.stringify({type:'join',room}));
+    setTimeout(()=>{ processPending(); maybeCreateOffer(); },600);
+  };
+  ws.onclose=(ev)=>{ log(`信令服务器连接已关闭，代码: ${ev.code}, 原因: ${ev.reason||'无'}`); setConn(false); };
+  ws.onerror=(ev)=>log(`信令服务器连接错误: ${JSON.stringify({isTrusted:ev.isTrusted})}`,true);
+
+  ws.onmessage=async(evt)=>{
+    let msg=null; try{ msg=JSON.parse(evt.data);}catch{ log('收到非JSON消息'); return; }
+    log(`收到消息: ${msg.type}`);
+
+    switch(msg.type){
+      case 'offer':{
+        if(!pc){ log('收到OFFER，自动初始化本地连接'); pendingOffer=msg.sdp; try{ startWebRTC(localStream||new MediaStream()); }catch(e){ log('自动初始化失败: '+e.message,true);} setTimeout(processPending,0); return; }
+        try{
+          if(pc.signalingState==='have-local-offer'){ try{ await pc.setLocalDescription({type:'rollback'}); log('检测到glare，已回滚本地offer'); }catch(e){ log('回滚失败: '+e.message,true); } }
+          const norm=normalizeSdp(msg.sdp,'offer'); if(!norm){ log('收到的OFFER格式不正确',true); break; }
+          await pc.setRemoteDescription(norm); remoteDescSet=true;
+          const ans=await pc.createAnswer(); await pc.setLocalDescription(ans);
+          ws&&ws.readyState===WebSocket.OPEN&&ws.send(JSON.stringify({type:'answer',room,sdp:pc.localDescription}));
+          log('已回复ANSWER');
+        }catch(e){ log('处理OFFER失败: '+e.message,true); }
+        break;
+      }
+      case 'answer':{
+        if(!pc) break;
+        if(pc.signalingState==='stable'){ log('已在 stable，忽略重复ANSWER'); break; }
+        try{
+          const norm=normalizeSdp(msg.sdp,'answer'); if(!norm){ log('收到的ANSWER格式不正确',true); break; }
+          await pc.setRemoteDescription(norm); remoteDescSet=true; log('已处理ANSWER'); setTimeout(processPending,0);
+        }catch(e){ log('处理ANSWER失败: '+e.message,true); }
+        break;
+      }
+      case 'candidate':{
+        const raw=msg.candidate?msg.candidate:msg;
+        let sdpMid=raw.sdpMid, sdpMLineIndex=raw.sdpMLineIndex;
+        if((sdpMid==null||sdpMid==="")&&(sdpMLineIndex==null)){ try{ const t=pc&&pc.transceivers&&pc.transceivers[0]; if(t&&t.mid) sdpMid=t.mid; if(sdpMid==null) sdpMLineIndex=0; }catch{} }
+        if(!pc||!remoteDescSet){ pendingCandidates.push({candidate:raw.candidate,sdpMid,sdpMLineIndex}); return; }
+        try{ await pc.addIceCandidate({candidate:raw.candidate,sdpMid,sdpMLineIndex}); log('已添加ICE候选'); }catch(e){ log('添加ICE候选失败: '+e.message,true); }
+        break;
+      }
+      default: log('忽略未知消息类型: '+msg.type);
+    }
+  };
+}
+
+function leaveRoom(){
+  try{ ws&&ws.readyState===WebSocket.OPEN&&ws.send(JSON.stringify({type:'leave',room})); }catch{}
+  try{ ws&&ws.close(); }catch{} ws=null;
+  try{ pc&&pc.close(); }catch{} pc=null;
+  pendingOffer=null; pendingCandidates=[]; remoteDescSet=false; makingOffer=false;
+  setConn(false); log('已离开房间');
+}
+
+document.addEventListener('DOMContentLoaded',()=>{
+  const serverInput=document.getElementById('server');
+  const proto=(location.protocol==='https:')?'wss':'ws';
+  serverInput.value=`${proto}://${location.host}/webrtc`;
+  if(!window.isSecureContext&&location.hostname!=='localhost'){ log('提示：非HTTPS环境在部分浏览器无法使用摄像头；建议通过HTTPS/wss访问',true); }
+  document.getElementById('joinBtn').addEventListener('click',()=>{ joinRoom().catch(e=>log(e.message,true)); });
+  document.getElementById('leaveBtn').addEventListener('click',()=>{ leaveRoom(); });
+  log('系统已就绪，等待加入房间');
+});
+</script>
+</body>
+</html>
